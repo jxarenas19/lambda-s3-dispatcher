@@ -88,6 +88,9 @@ func init() {
 }
 
 func Handler(ctx context.Context) (Output, error) {
+	innitialTime := time.Now()
+	formattedInnitialTime := innitialTime.Format("2006-01-02 15:04:05")
+	fmt.Println("Formatted Time:", formattedInnitialTime)
 	if bucket == "" || apiURL == "" {
 		return Output{}, errors.New("faltan envs: BUCKET_NAME o API_URL")
 	}
@@ -98,7 +101,7 @@ func Handler(ctx context.Context) (Output, error) {
 	if err != nil {
 		return Output{}, fmt.Errorf("listKeys: %w", err)
 	}
-
+	keys = keys
 	out := Output{
 		Bucket:    bucket,
 		Prefix:    prefix,
@@ -145,7 +148,8 @@ func Handler(ctx context.Context) (Output, error) {
 		}
 		out.APIResponses = append(out.APIResponses, r)
 	}
-
+	dur := time.Since(innitialTime)
+	fmt.Printf("La función tardó %v\n", dur)
 	return out, nil
 }
 

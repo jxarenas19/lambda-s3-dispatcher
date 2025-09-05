@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 )
 
@@ -17,8 +16,8 @@ func testHandler() {
 	// Si usas perfiles locales: export AWS_PROFILE=default (desde la terminal)
 
 	// Caso 1: presigned
-	out1, err := Handler(context.Background())
-	fmt.Println("PRESIGNED =>", asJSON(out1), "ERR:", err)
+	Handler(context.Background())
+
 }
 
 func asJSON(v any) string {
