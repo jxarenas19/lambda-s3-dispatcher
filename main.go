@@ -24,6 +24,10 @@ type APIRequest struct {
 	URL string `json:"url"`
 }
 
+type BatchAPIRequest struct {
+	Items []APIRequest `json:"items"`
+}
+
 type OCRResult struct {
 	Key       string `json:"key"`
 	SourceURL string `json:"source_url,omitempty"`
@@ -35,6 +39,10 @@ type APIResponse struct {
 	StatusCode int        `json:"status_code"`
 	Result     *OCRResult `json:"result,omitempty"`
 	Err        string     `json:"err,omitempty"`
+}
+
+type BatchAPIResponse struct {
+	Results []APIResponse `json:"results"`
 }
 
 type Output struct {
@@ -50,10 +58,12 @@ var (
 	presigner  *s3.PresignClient
 	httpClient *http.Client
 
-	bucket string
-	prefix string
-	apiURL string
-	limit  int
+	bucket    string
+	prefix    string
+	apiURL    string
+	limit     int
+	batchSize int
+	useBatch  bool
 )
 
 func init() {
@@ -68,6 +78,20 @@ func init() {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
+	}
+
+	// Batch size (opcional, default 50)
+	batchSize = 50
+	if v := os.Getenv("BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			batchSize = n
+		}
+	}
+
+	// Use batch mode (opcional, default false)
+	useBatch = false
+	if v := os.Getenv("USE_BATCH"); v != "" {
+		useBatch = v == "true" || v == "1"
 	}
 
 	httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -88,6 +112,9 @@ func init() {
 }
 
 func Handler(ctx context.Context) (Output, error) {
+	innitialTime := time.Now()
+	formattedInnitialTime := innitialTime.Format("2006-01-02 15:04:05")
+	fmt.Println("Formatted Time:", formattedInnitialTime)
 	if bucket == "" || apiURL == "" {
 		return Output{}, errors.New("faltan envs: BUCKET_NAME o API_URL")
 	}
@@ -98,7 +125,7 @@ func Handler(ctx context.Context) (Output, error) {
 	if err != nil {
 		return Output{}, fmt.Errorf("listKeys: %w", err)
 	}
-
+	keys = keys
 	out := Output{
 		Bucket:    bucket,
 		Prefix:    prefix,
@@ -108,44 +135,79 @@ func Handler(ctx context.Context) (Output, error) {
 		return out, nil
 	}
 
-	results := make(chan APIResponse, len(keys))
-	sem := make(chan struct{}, limit)
-	var wg sync.WaitGroup
+	if useBatch {
+		// Process keys in batches
+		for i := 0; i < len(keys); i += batchSize {
+			// Check if context was cancelled
+			select {
+			case <-ctx.Done():
+				out.Errors = append(out.Errors, "context cancelled/timeout")
+				break
+			default:
+			}
 
-	for _, key := range keys {
-		// corta si el contexto fue cancelado
-		select {
-		case <-ctx.Done():
-			out.Errors = append(out.Errors, "context cancelled/timeout")
-			break
-		default:
+			// Calculate batch end
+			end := i + batchSize
+			if end > len(keys) {
+				end = len(keys)
+			}
+			batch := keys[i:end]
+
+			fmt.Printf("Processing batch %d-%d (%d items)\n", i+1, end, len(batch))
+
+			// Process current batch
+			batchResults := processBatch(ctx, batch)
+
+			// Collect results from current batch
+			for _, r := range batchResults {
+				if r.Err != "" || r.StatusCode >= 400 {
+					out.Errors = append(out.Errors, fmt.Sprintf("%s: %s", r.Key, r.Err))
+				}
+				out.APIResponses = append(out.APIResponses, r)
+			}
+		}
+	} else {
+		// Process keys individually with concurrency control
+		results := make(chan APIResponse, len(keys))
+		sem := make(chan struct{}, limit)
+		var wg sync.WaitGroup
+
+		for _, key := range keys {
+			// Check if context was cancelled
+			select {
+			case <-ctx.Done():
+				out.Errors = append(out.Errors, "context cancelled/timeout")
+				break
+			default:
+			}
+
+			wg.Add(1)
+			sem <- struct{}{} // acquire slot
+			go func(k string) {
+				defer wg.Done()
+				resp := processOnePresigned(ctx, k)
+				// Release slot BEFORE sending to channel to avoid circular deadlock
+				<-sem
+				results <- resp
+			}(key)
 		}
 
-		wg.Add(1)
-		sem <- struct{}{} // adquiere cupo
-		go func(k string) {
-			defer wg.Done()
-			resp := processOnePresigned(ctx, k)
-			// Libera el cupo ANTES de enviar al canal para evitar bloqueo circular
-			<-sem
-			results <- resp
-		}(key)
-	}
+		// Close channel when all goroutines finish
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
 
-	// cierra el canal al terminar todas
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// recolecta
-	for r := range results {
-		if r.Err != "" || r.StatusCode >= 400 {
-			out.Errors = append(out.Errors, fmt.Sprintf("%s: %s", r.Key, r.Err))
+		// Collect results
+		for r := range results {
+			if r.Err != "" || r.StatusCode >= 400 {
+				out.Errors = append(out.Errors, fmt.Sprintf("%s: %s", r.Key, r.Err))
+			}
+			out.APIResponses = append(out.APIResponses, r)
 		}
-		out.APIResponses = append(out.APIResponses, r)
 	}
-
+	dur := time.Since(innitialTime)
+	fmt.Printf("La función tardó %v\n", dur)
 	return out, nil
 }
 
@@ -174,8 +236,72 @@ func listKeys(ctx context.Context, bucket, prefix string) ([]string, error) {
 	return keys, nil
 }
 
+func processBatch(ctx context.Context, keys []string) []APIResponse {
+	// Generate presigned URLs for all keys in the batch
+	var batchItems []APIRequest
+
+	for _, key := range keys {
+		// Check if context was cancelled
+		select {
+		case <-ctx.Done():
+			return []APIResponse{{Key: key, Err: "context cancelled/timeout"}}
+		default:
+		}
+
+		// Generate presigned URL for this key
+		ps, err := presigner.PresignGetObject(ctx, &s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &key,
+		}, s3.WithPresignExpires(10*time.Minute))
+
+		if err != nil {
+			return []APIResponse{{Key: key, Err: "presign: " + err.Error()}}
+		}
+
+		batchItems = append(batchItems, APIRequest{
+			Key: key,
+			URL: ps.URL,
+		})
+	}
+
+	// Send entire batch to API
+	batchRequest := BatchAPIRequest{Items: batchItems}
+	body, err := json.Marshal(batchRequest)
+	if err != nil {
+		return []APIResponse{{Err: "marshal batch request: " + err.Error()}}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+"/ocr/batch", strings.NewReader(string(body)))
+	if err != nil {
+		return []APIResponse{{Err: "build batch request: " + err.Error()}}
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return []APIResponse{{Err: "http batch request: " + err.Error()}}
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return []APIResponse{{Err: "read batch response: " + err.Error()}}
+	}
+
+	if resp.StatusCode != 200 {
+		return []APIResponse{{StatusCode: resp.StatusCode, Err: string(respBody)}}
+	}
+
+	var batchResponse BatchAPIResponse
+	if err := json.Unmarshal(respBody, &batchResponse); err != nil {
+		return []APIResponse{{Err: "parse batch response: " + err.Error()}}
+	}
+
+	return batchResponse.Results
+}
+
 func processOnePresigned(ctx context.Context, key string) APIResponse {
-	// Presign GET (válida 10 min)
+	// Presign GET (valid for 10 min)
 	ps, err := presigner.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
@@ -184,7 +310,7 @@ func processOnePresigned(ctx context.Context, key string) APIResponse {
 		return APIResponse{Key: key, Err: "presign: " + err.Error()}
 	}
 
-	// Llama a la API mock (chi) con JSON {key, url}
+	// Call API with JSON {key, url}
 	body, _ := json.Marshal(APIRequest{Key: key, URL: ps.URL})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+"/ocr", strings.NewReader(string(body)))
 	if err != nil {

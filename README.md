@@ -1,69 +1,86 @@
-# 🧪 Lambda S3 Dispatcher - PRUEBA DE CONCEPTO
+# 🧪 Lambda S3 Dispatcher - PROOF OF CONCEPT
 
-> ⚠️ **PROYECTO DE PRUEBA** - Este es un código experimental para demostrar integración S3 + API OCR
+> ⚠️ **TEST PROJECT** - This is experimental code to demonstrate S3 + OCR API integration
 
-## ¿Qué hace?
+## What does it do?
 
-Un dispatcher simple que:
+A simple dispatcher that:
 
-1. **Lee imágenes** de un bucket S3 
-2. **Genera URLs prefirmadas** (presigned URLs) para cada imagen
-3. **Envía las URLs** a una API de OCR externa
-4. **Recolecta y estructura** las respuestas
+1. **Reads images** from an S3 bucket 
+2. **Generates presigned URLs** for each image
+3. **Sends URLs** to an external OCR API
+4. **Collects and structures** the responses
 
-## Flujo básico
-
+## Basic flow
 
 ```
-S3 Bucket → Lista archivos → Presigned URLs → API OCR → Resultados JSON
+S3 Bucket → List files → Presigned URLs → OCR API → JSON Results
 ```
 
-## Variables de entorno requeridas
+## Required environment variables
 
 ```bash
-export BUCKET_NAME="tu-bucket-s3"
-export API_URL="http://localhost:8080"  # URL de tu API OCR
-export AWS_REGION="us-east-1"           # Región del bucket
+export BUCKET_NAME="your-s3-bucket"
+export API_URL="http://localhost:8080"  # Your OCR API URL
+export AWS_REGION="us-east-1"           # Bucket region
 ```
 
-## Variables opcionales
+## Optional variables
 
 ```bash
-export PREFIX="imagenes/"               # Filtrar archivos por prefijo
-export MAX_CONCURRENCY="10"            # Límite de requests paralelos (default: 10)
-export AWS_PROFILE="tu-perfil"         # Perfil AWS específico
+export PREFIX="images/"                 # Filter files by prefix
+export MAX_CONCURRENCY="10"            # Parallel request limit (default: 10)
+export BATCH_SIZE="50"                  # Batch processing size (default: 50)
+export USE_BATCH="true"                 # Enable batch mode (default: false)
+export AWS_PROFILE="your-profile"      # Specific AWS profile
 ```
 
-## Uso
+## Usage
 
-### Ejecución local de prueba
+### Local test execution
 ```bash
 go run .
 ```
 
-### Como Lambda (comentar testHandler, descomentar lambda.Start)
+### As Lambda (comment testHandler, uncomment lambda.Start)
 ```go
 func main() {
-    // testHandler()  // ← comentar esta línea
-    lambda.Start(Handler)  // ← descomentar esta línea
+    // testHandler()  // ← comment this line
+    lambda.Start(Handler)  // ← uncomment this line
 }
 ```
 
-## Estructura de respuesta
+## Processing Modes
+
+The dispatcher supports two processing modes:
+
+### Individual Mode (Default: `USE_BATCH=false`)
+- Each file is processed individually with concurrent requests
+- Uses `MAX_CONCURRENCY` to limit parallel requests (default: 10)
+- Calls `POST /ocr` endpoint for each file
+- Compatible with existing OCR APIs
+
+### Batch Mode (`USE_BATCH=true`)
+- Files are processed in sequential batches of size `BATCH_SIZE` (default: 50)
+- Each batch is sent as a single API request to `/ocr/batch` endpoint
+- Reduces API overhead and provides better resource management for large datasets
+- Requires API to support batch processing endpoint
+
+## Response structure
 
 ```json
 {
   "bucket": "test-images-bucket",
-  "prefix": "imagenes/",
+  "prefix": "images/",
   "processed": 30,
   "api_responses": [
     {
-      "key": "imagenes/foto1.png",
+      "key": "images/photo1.png",
       "status_code": 200,
       "result": {
-        "key": "imagenes/foto1.png",
+        "key": "images/photo1.png",
         "source_url": "https://...",
-        "full_text": "Texto extraído de la imagen"
+        "full_text": "Extracted text from image"
       }
     }
   ],
@@ -71,26 +88,56 @@ func main() {
 }
 ```
 
-## Requisitos
+## Requirements
 
 - **Go 1.19+**
-- **Credenciales AWS** configuradas
-- **API OCR** corriendo que acepte `POST /ocr` con formato:
+- **AWS credentials** configured
+- **OCR API** running that accepts:
+
+**Individual Mode:** `POST /ocr` with format:
   ```json
-  {"key": "archivo.png", "url": "https://presigned-url..."}
+  {"key": "file.png", "url": "https://presigned-url..."}
   ```
 
-## ⚠️ Nota importante
+**Batch Mode:** `POST /ocr/batch` with format:
+  ```json
+  {
+    "items": [
+      {"key": "file1.png", "url": "https://presigned-url1..."},
+      {"key": "file2.png", "url": "https://presigned-url2..."}
+    ]
+  }
+  ```
 
-Este es un **código de prueba** para validar la arquitectura. En producción necesitarías:
+  And returns:
+  ```json
+  {
+    "results": [
+      {
+        "key": "file1.png",
+        "status_code": 200,
+        "result": {"key": "file1.png", "source_url": "https://...", "full_text": "..."}
+      },
+      {
+        "key": "file2.png", 
+        "status_code": 200,
+        "result": {"key": "file2.png", "source_url": "https://...", "full_text": "..."}
+      }
+    ]
+  }
+  ```
 
-- Manejo de errores más robusto
-- Logging estructurado
-- Métricas y monitoring
-- Timeouts configurables
+## ⚠️ Important note
+
+This is **test code** to validate the architecture. For production you would need:
+
+- More robust error handling
+- Structured logging
+- Metrics and monitoring
+- Configurable timeouts
 - Rate limiting
-- Tests unitarios
+- Unit tests
 
 ---
 
-*Desarrollado como POC para integración S3 + OCR API*
+*Developed as POC for S3 + OCR API integration*
