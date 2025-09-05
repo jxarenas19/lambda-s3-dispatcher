@@ -13,6 +13,7 @@ Un dispatcher simple que:
 
 ## Flujo básico
 
+
 ```
 S3 Bucket → Lista archivos → Presigned URLs → API OCR → Resultados JSON
 ```
