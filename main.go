@@ -10,13 +10,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	// "github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"golang.org/x/sync/errgroup"
 )
 
 type APIRequest struct {
@@ -125,7 +125,7 @@ func Handler(ctx context.Context) (Output, error) {
 	if err != nil {
 		return Output{}, fmt.Errorf("listKeys: %w", err)
 	}
-	keys = keys
+	keys = keys[1:2]
 	out := Output{
 		Bucket:    bucket,
 		Prefix:    prefix,
@@ -136,9 +136,7 @@ func Handler(ctx context.Context) (Output, error) {
 	}
 
 	if useBatch {
-		// Process keys in batches
 		for i := 0; i < len(keys); i += batchSize {
-			// Check if context was cancelled
 			select {
 			case <-ctx.Done():
 				out.Errors = append(out.Errors, "context cancelled/timeout")
@@ -146,7 +144,6 @@ func Handler(ctx context.Context) (Output, error) {
 			default:
 			}
 
-			// Calculate batch end
 			end := i + batchSize
 			if end > len(keys) {
 				end = len(keys)
@@ -155,10 +152,8 @@ func Handler(ctx context.Context) (Output, error) {
 
 			fmt.Printf("Processing batch %d-%d (%d items)\n", i+1, end, len(batch))
 
-			// Process current batch
 			batchResults := processBatch(ctx, batch)
 
-			// Collect results from current batch
 			for _, r := range batchResults {
 				if r.Err != "" || r.StatusCode >= 400 {
 					out.Errors = append(out.Errors, fmt.Sprintf("%s: %s", r.Key, r.Err))
@@ -167,43 +162,32 @@ func Handler(ctx context.Context) (Output, error) {
 			}
 		}
 	} else {
-		// Process keys individually with concurrency control
-		results := make(chan APIResponse, len(keys))
-		sem := make(chan struct{}, limit)
-		var wg sync.WaitGroup
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(limit)
 
-		for _, key := range keys {
-			// Check if context was cancelled
-			select {
-			case <-ctx.Done():
-				out.Errors = append(out.Errors, "context cancelled/timeout")
-				break
-			default:
-			}
+		responses := make([]APIResponse, len(keys))
 
-			wg.Add(1)
-			sem <- struct{}{} // acquire slot
-			go func(k string) {
-				defer wg.Done()
-				resp := processOnePresigned(ctx, k)
-				// Release slot BEFORE sending to channel to avoid circular deadlock
-				<-sem
-				results <- resp
-			}(key)
+		for i, key := range keys {
+			i, key := i, key
+			g.Go(func() error {
+				resp := processOnePresigned(gctx, key)
+				responses[i] = resp
+
+				return nil
+			})
 		}
 
-		// Close channel when all goroutines finish
-		go func() {
-			wg.Wait()
-			close(results)
-		}()
+		if err := g.Wait(); err != nil {
+			out.Errors = append(out.Errors, "errgroup: "+err.Error())
+		}
 
-		// Collect results
-		for r := range results {
-			if r.Err != "" || r.StatusCode >= 400 {
-				out.Errors = append(out.Errors, fmt.Sprintf("%s: %s", r.Key, r.Err))
+		for _, r := range responses {
+			if r.Key != "" {
+				if r.Err != "" || r.StatusCode >= 400 {
+					out.Errors = append(out.Errors, fmt.Sprintf("%s: %s", r.Key, r.Err))
+				}
+				out.APIResponses = append(out.APIResponses, r)
 			}
-			out.APIResponses = append(out.APIResponses, r)
 		}
 	}
 	dur := time.Since(innitialTime)

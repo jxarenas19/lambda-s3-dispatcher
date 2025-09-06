@@ -56,7 +56,9 @@ The dispatcher supports two processing modes:
 
 ### Individual Mode (Default: `USE_BATCH=false`)
 - Each file is processed individually with concurrent requests
-- Uses `MAX_CONCURRENCY` to limit parallel requests (default: 10)
+- Uses `golang.org/x/sync/errgroup` for optimized concurrency control
+- Built-in concurrency limiting with `MAX_CONCURRENCY` (default: 10)
+- Improved error handling and context cancellation
 - Calls `POST /ocr` endpoint for each file
 - Compatible with existing OCR APIs
 
